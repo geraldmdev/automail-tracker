@@ -16,6 +16,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             campaign_id TEXT,
+            customer_id TEXT,
             action TEXT,
             timestamp DATETIME,
             ip TEXT,
@@ -23,6 +24,14 @@ def init_db():
             target_url TEXT
         )
     ''')
+    
+    # Simple migration: try to add customer_id if table exists but column doesn't
+    try:
+        cursor.execute("ALTER TABLE events ADD COLUMN customer_id TEXT")
+    except sqlite3.OperationalError:
+        # Column already exists
+        pass
+        
     conn.commit()
     conn.close()
 
@@ -33,12 +42,13 @@ def read_root():
     return {"status": "operational", "service": "AutoMail Tracking"}
 
 @app.get("/open/{cid}")
-def track_open(cid: str, request: Request):
+@app.get("/open/{cid}/{uid}")
+def track_open(cid: str, request: Request, uid: str = None):
     """
     Tracking pixel endpoint.
-    Example: GET /open/123
+    Example: GET /open/123 or GET /open/123/user456
     """
-    log_event(cid, "open", request)
+    log_event(cid, "open", request, customer_id=uid)
     
     # Return 1x1 transparent GIF
     pixel_data = b'\x47\x49\x46\x38\x39\x61\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00\x21\xf9\x04\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b'
@@ -49,12 +59,13 @@ def track_open(cid: str, request: Request):
     })
 
 @app.get("/click/{cid}")
-def track_click(cid: str, url: str, request: Request):
+@app.get("/click/{cid}/{uid}")
+def track_click(cid: str, url: str, request: Request, uid: str = None):
     """
     Link redirect endpoint.
-    Example: GET /click/123?url=https://google.com
+    Example: GET /click/123?url=... or GET /click/123/user456?url=...
     """
-    log_event(cid, "click", request, target_url=url)
+    log_event(cid, "click", request, customer_id=uid, target_url=url)
     return RedirectResponse(url=url)
 
 @app.get("/stats/{cid}")
@@ -65,20 +76,25 @@ def get_stats(cid: str):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    cursor.execute("SELECT COUNT(*) FROM events WHERE campaign_id = ? AND action = 'open'", (cid,))
-    opens = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(DISTINCT customer_id) FROM events WHERE campaign_id = ? AND action = 'open'", (cid,))
+    unique_opens = cursor.fetchone()[0]
     
-    cursor.execute("SELECT COUNT(*) FROM events WHERE campaign_id = ? AND action = 'click'", (cid,))
-    clicks = cursor.fetchone()[0]
+    # Also count total opens for internal stats if needed, but return unique to user
+    cursor.execute("SELECT COUNT(*) FROM events WHERE campaign_id = ? AND action = 'open'", (cid,))
+    total_opens = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(DISTINCT customer_id) FROM events WHERE campaign_id = ? AND action = 'click'", (cid,))
+    unique_clicks = cursor.fetchone()[0]
     
     conn.close()
     return {
         "campaign_id": cid,
-        "opens": opens,
-        "clicks": clicks
+        "opens": unique_opens,
+        "clicks": unique_clicks,
+        "total_opens": total_opens
     }
 
-def log_event(cid, action, request, target_url=None):
+def log_event(cid, action, request, customer_id=None, target_url=None):
     try:
         ip = request.client.host
         ua = request.headers.get("user-agent", "unknown")
@@ -87,9 +103,9 @@ def log_event(cid, action, request, target_url=None):
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO events (campaign_id, action, timestamp, ip, user_agent, target_url)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (cid, action, ts, ip, ua, target_url))
+            INSERT INTO events (campaign_id, customer_id, action, timestamp, ip, user_agent, target_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (cid, customer_id, action, ts, ip, ua, target_url))
         conn.commit()
         conn.close()
     except Exception as e:
